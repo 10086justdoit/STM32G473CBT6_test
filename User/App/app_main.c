@@ -4,25 +4,30 @@
 #include "bsp_uart.h"
 #include "vofa_service.h"
 #include "motor_service.h"
+#include "as5048a.h"
 
-#define APP_MOTOR_DT_S              0.001f      /* 电机服务更新周期，单位 s */
+#define APP_MOTOR_DT_S              0.001f
 
-#define APP_OPEN_LOOP_TARGET_UQ     1.2f        /* 开环目标 Uq 电压幅值 */
-#define APP_OPEN_LOOP_FREQ_HZ       0.8f        /* 开环电角度旋转频率，单位 Hz */
-#define APP_UQ_RAMP_STEP            0.0005f     /* 开环电压幅值每次更新增加的步长，单位 V */
+/*
+ * 对齐完成后的开环验证参数
+ */
+#define APP_OPEN_LOOP_TARGET_UQ     0.8f
+#define APP_OPEN_LOOP_FREQ_HZ       0.5f
+#define APP_UQ_RAMP_STEP            0.0005f
 
-#define APP_ENABLE_DELAY_COUNT      1000U       /* 启动后等待多少次循环（约 1s）再使能驱动，单位 count */
-#define APP_CURRENT_LIMIT_A         1.0f        /* 电流限制，单位 A，超过这个值就停机 */
+/*
+ * 电流保护
+ */
+#define APP_CURRENT_LIMIT_A         1.0f
 
-static uint16_t s_print_count = 0U;             /* 用于控制打印频率的计数器 */
-static uint16_t s_enable_delay_count = 0U;      /* 用于控制启动后延迟使能驱动的计数器 */
-
-static float s_current_uq = 0.0f;               /* 当前开环 Uq 电压幅值 */
-static uint8_t s_driver_enabled = 0U;
+static uint16_t s_print_count = 0U;
+static float s_current_uq = 0.0f;
+static uint8_t s_align_ok = 0U;
 
 void App_Init(void)
 {
     Motor_Service_Status_t status;
+    const Motor_Service_Data_t *motor;
 
     BSP_UART_Init();
     VOFA_Service_Init();
@@ -36,16 +41,57 @@ void App_Init(void)
     else
     {
         VOFA_Service_FireWater("Motor_Service init failed,%d", status);
+        return;
     }
 
-    Motor_Service_StartOpenLoopElectrical(0.0f, APP_OPEN_LOOP_FREQ_HZ);
+    /*
+     * 初始化完成后先保持关闭驱动。
+     */
     Motor_Service_DisableDriver();
 
-    s_current_uq = 0.0f;
-    s_driver_enabled = 0U;
-    s_enable_delay_count = 0U;
+    VOFA_Service_SendTextLine("Align prepare");
+    HAL_Delay(1000);
 
-    VOFA_Service_SendTextLine("Motor open-loop prepare");
+    /*
+     * 开始零电角度对齐。
+     * 注意：这个函数内部会使能驱动，并让电机产生力矩。
+     */
+    VOFA_Service_SendTextLine("Align start");
+
+    status = Motor_Service_AlignSensor();
+
+    if (status == MOTOR_SERVICE_OK)
+    {
+        motor = Motor_Service_GetData();
+
+        s_align_ok = 1U;
+
+        VOFA_Service_SendTextLine("Align ok");
+
+        VOFA_Service_FireWater("zero=%.6f,dir=%d",
+                               motor->zero_electric_angle,
+                               motor->direction);
+
+        /*
+         * 对齐结束后，做一个低压开环验证。
+         */
+        s_current_uq = 0.0f;
+
+        Motor_Service_StartOpenLoopElectrical(0.0f,
+                                              APP_OPEN_LOOP_FREQ_HZ);
+
+        Motor_Service_EnableDriver();
+
+        VOFA_Service_SendTextLine("Open loop verify start");
+    }
+    else
+    {
+        s_align_ok = 0U;
+
+        Motor_Service_Stop();
+
+        VOFA_Service_FireWater("Align failed,%d", status);
+    }
 }
 
 void App_Start(void)
@@ -57,31 +103,25 @@ void App_Loop(void)
     Motor_Service_Status_t status;
     const Motor_Service_Data_t *motor;
 
-    if (s_driver_enabled == 0U)
+    if (s_align_ok == 0U)
     {
-        s_enable_delay_count++;
-
-        if (s_enable_delay_count >= APP_ENABLE_DELAY_COUNT)
-        {
-            Motor_Service_EnableDriver();
-            s_driver_enabled = 1U;
-
-            VOFA_Service_SendTextLine("Motor driver enabled");
-        }
+        HAL_Delay(100);
+        return;
     }
-    else
+
+    /*
+     * 对齐成功后，Uq 慢慢爬升，验证电机能否平稳开环转动。
+     */
+    if (s_current_uq < APP_OPEN_LOOP_TARGET_UQ)
     {
-        if (s_current_uq < APP_OPEN_LOOP_TARGET_UQ)
+        s_current_uq += APP_UQ_RAMP_STEP;
+
+        if (s_current_uq > APP_OPEN_LOOP_TARGET_UQ)
         {
-            s_current_uq += APP_UQ_RAMP_STEP;
-
-            if (s_current_uq > APP_OPEN_LOOP_TARGET_UQ)
-            {
-                s_current_uq = APP_OPEN_LOOP_TARGET_UQ;
-            }
-
-            Motor_Service_SetOpenLoopVoltage(s_current_uq);
+            s_current_uq = APP_OPEN_LOOP_TARGET_UQ;
         }
+
+        Motor_Service_SetOpenLoopVoltage(s_current_uq);
     }
 
     status = Motor_Service_Update(APP_MOTOR_DT_S);
@@ -89,31 +129,57 @@ void App_Loop(void)
     if (status != MOTOR_SERVICE_OK)
     {
         Motor_Service_Stop();
+
         VOFA_Service_FireWater("Motor_Service error,%d", status);
+
         HAL_Delay(100);
         return;
     }
 
     motor = Motor_Service_GetData();
 
+    /*
+     * 简单过流保护。
+     */
     if ((motor->ia_lpf > APP_CURRENT_LIMIT_A) ||
         (motor->ia_lpf < -APP_CURRENT_LIMIT_A) ||
         (motor->ib_lpf > APP_CURRENT_LIMIT_A) ||
         (motor->ib_lpf < -APP_CURRENT_LIMIT_A))
     {
         Motor_Service_Stop();
+
         VOFA_Service_SendTextLine("over current stop");
+
         HAL_Delay(500);
         return;
     }
 
     s_print_count++;
 
-    if (s_print_count >= 100U)
+    if (s_print_count >= 200U)
     {
         s_print_count = 0U;
 
-        VOFA_Service_FireWater("%.3f,%u,%.3f,%.3f,%.3f,%.3f,%.4f,%.4f,%.3f,%u",
+        /*
+         * 输出格式：
+         *
+         * I0  = open_loop_electrical_angle
+         * I1  = sector
+         * I2  = duty_a
+         * I3  = duty_b
+         * I4  = duty_c
+         * I5  = uq
+         * I6  = ia_lpf
+         * I7  = ib_lpf
+         * I8  = raw_angle
+         * I9  = mechanical_angle
+         * I10 = electrical_angle
+         * I11 = velocity_rpm
+         * I12 = zero_electric_angle
+         * I13 = direction
+         * I14 = driver_enabled
+         */
+        VOFA_Service_FireWater("%.3f,%u,%.3f,%.3f,%.3f,%.3f,%.4f,%.4f,%u,%.3f,%.3f,%.3f,%.3f,%d,%u",
                                motor->open_loop_electrical_angle,
                                motor->svpwm.sector,
                                motor->duty.duty_a,
@@ -122,7 +188,12 @@ void App_Loop(void)
                                s_current_uq,
                                motor->ia_lpf,
                                motor->ib_lpf,
+                               motor->raw_angle,
+                               motor->mechanical_angle,
                                motor->electrical_angle,
+                               AS5048A_GetVelocityRpm(),
+                               motor->zero_electric_angle,
+                               motor->direction,
                                motor->driver_enabled);
     }
 
