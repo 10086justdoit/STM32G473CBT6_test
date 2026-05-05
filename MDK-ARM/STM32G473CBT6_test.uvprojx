@@ -715,6 +715,11 @@
               <FileType>1</FileType>
               <FilePath>..\User\Algorithm\foc.c</FilePath>
             </File>
+            <File>
+              <FileName>pid_controller.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\User\Algorithm\pid_controller.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
