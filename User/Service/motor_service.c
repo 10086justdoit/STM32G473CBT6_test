@@ -32,14 +32,17 @@
 #define MOTOR_SERVICE_BUS_VOLTAGE                  12.0f      /* 母线电压，单位 V */
 #define MOTOR_SERVICE_POLE_PAIRS                   11U        /* 电机极对数 */
 
-#define MOTOR_SERVICE_ZERO_ELECTRIC_ANGLE          0.587899f  /* 电角度零位，来自对齐测试 */
-#define MOTOR_SERVICE_DIRECTION                    1          /* 默认旋转方向，1 = 正向，-1 = 反向 */
+#define MOTOR_SERVICE_ZERO_ELECTRIC_ANGLE          4.588000f  /* 电角度零位，来自对齐测试 */
+#define MOTOR_SERVICE_DIRECTION                    -1          /* 默认旋转方向，1 = 正向，-1 = 反向 */
 
 #define MOTOR_SERVICE_OPEN_LOOP_UQ_DEFAULT         0.5f       /* 开环默认 Uq 电压，单位 V */
 #define MOTOR_SERVICE_OPEN_LOOP_FREQ_DEFAULT       1.0f       /* 开环默认电角度频率，单位 Hz */
 
 #define MOTOR_SERVICE_CURRENT_LPF_ALPHA            0.05f      /* 电流低通滤波系数 */
+#define MOTOR_SERVICE_SPEED_LPF_ALPHA              0.02f      /* 速度低通滤波系数 */
 #define MOTOR_SERVICE_CURRENT_CAL_SAMPLES          100U       /* INA240 零点校准采样次数 */
+
+#define MOTOR_SERVICE_RAD_TO_RPM                   9.5492966f /* rad/s 转 rpm 系数 */
 
 /* ============================================================
  * 电流采样相序配置
@@ -49,7 +52,7 @@
  * 2：交换 A/B，并反向 ib，ia = rawB，ib = -rawA
  * 3：交换 A/B，并反向 ia，ia = -rawB，ib = rawA
  *
- * 当前建议先测试 2U。
+ * 当前电流环已经验证通过，保持 0U。
  * ============================================================ */
 
 #define MOTOR_SERVICE_CURRENT_MAP_MODE             0U
@@ -65,16 +68,45 @@
 
 #define MOTOR_SERVICE_CURRENT_LOOP_V_LIMIT         1.2f       /* 电流环输出电压限制，单位 V */
 
-#define MOTOR_SERVICE_PID_ID_KP                    2.0f      /* D 轴电流环 P 参数 */
-#define MOTOR_SERVICE_PID_ID_KI                    15.0f       /* D 轴电流环 I 参数 */
+#define MOTOR_SERVICE_PID_ID_KP                    2.0f       /* D 轴电流环 P 参数 */
+#define MOTOR_SERVICE_PID_ID_KI                    15.0f      /* D 轴电流环 I 参数 */
 #define MOTOR_SERVICE_PID_ID_KD                    0.0f       /* D 轴电流环 D 参数 */
 
-#define MOTOR_SERVICE_PID_IQ_KP                    3.0f      /* Q 轴电流环 P 参数 */
-#define MOTOR_SERVICE_PID_IQ_KI                    35.0f       /* Q 轴电流环 I 参数 */
+#define MOTOR_SERVICE_PID_IQ_KP                    3.0f       /* Q 轴电流环 P 参数 */
+#define MOTOR_SERVICE_PID_IQ_KI                    35.0f      /* Q 轴电流环 I 参数 */
 #define MOTOR_SERVICE_PID_IQ_KD                    0.0f       /* Q 轴电流环 D 参数 */
 
 #define MOTOR_SERVICE_PID_INTEGRAL_LIMIT           1.0f       /* PID 积分项限制，单位 V */
+/* ============================================================
+ * 速度环 PID 配置区
+ *
+ * 速度环只输出 iq_ref。
+ * 电流环每 1ms 执行一次。
+ * 速度环每 10ms 执行一次。
+ * ============================================================ */
 
+#define MOTOR_SERVICE_SPEED_EST_DT_S               0.100f     /* 速度估算周期，单位 s */
+#define MOTOR_SERVICE_SPEED_EST_MAX_RPM            80.0f      /* 速度估算异常限幅，单位 rpm */
+
+#define MOTOR_SERVICE_SPEED_LOOP_DT_S              0.10f     /* 速度环周期，单位 s */
+#define MOTOR_SERVICE_SPEED_LOOP_DIVIDER           10U        /* 电流环 1ms，速度环 10ms */
+
+#define MOTOR_SERVICE_SPEED_FEEDBACK_DIRECTION     -1.0f      /* 速度反馈方向 */
+
+#define MOTOR_SERVICE_SPEED_LOOP_IQ_LIMIT          0.25f      /* 速度环输出 iq_ref 限幅，单位 A */
+
+#define MOTOR_SERVICE_PID_SPEED_KP                 0.003f     /* 速度环 P 参数，单位 A/rpm */
+#define MOTOR_SERVICE_PID_SPEED_KI                 0.004f     /* 速度环 I 参数 */
+#define MOTOR_SERVICE_PID_SPEED_KD                 0.0f       /* 速度环 D 参数 */
+
+#define MOTOR_SERVICE_PID_SPEED_INTEGRAL_LIMIT     0.10f      /* 速度环积分项限制，单位 A */
+
+#define MOTOR_SERVICE_SPEED_START_IQ_MIN           0.14f      /* 最小启动 iq_ref，单位 A */
+#define MOTOR_SERVICE_SPEED_START_EXIT_RATIO       0.70f      /* 达到目标速度 80% 后退出启动补偿 */
+
+#define MOTOR_SERVICE_SPEED_RUN_IQ_MIN             0.06f      /* 低速保持 iq_ref，单位 A */
+
+#define MOTOR_SERVICE_SPEED_IQ_SLEW_STEP           0.02f     /* iq_ref 每次最大变化量，单位 A */
 /* ============================================================
  * 编码器对齐配置区
  * ============================================================ */
@@ -93,10 +125,19 @@ static Motor_Service_Data_t s_motor;        /* 电机服务数据实例 */
 
 static LowPassFilter_t s_lpf_ia;            /* A 相电流低通滤波器 */
 static LowPassFilter_t s_lpf_ib;            /* B 相电流低通滤波器 */
+static LowPassFilter_t s_lpf_speed;         /* 机械速度低通滤波器 */
 
 static PID_Controller_t s_pid_id;           /* D 轴电流环 PID */
 static PID_Controller_t s_pid_iq;           /* Q 轴电流环 PID */
+static PID_Controller_t s_pid_speed;        /* 速度环 PID */
 
+static uint8_t s_speed_ready = 0U;           /* 速度计算初始化标志 */
+static float s_speed_last_angle = 0.0f;      /* 上一次机械角度，单位 rad */
+static float s_speed_accum_angle = 0.0f;     /* 速度估算累计角度，单位 rad */
+static float s_speed_accum_time = 0.0f;      /* 速度估算累计时间，单位 s */
+static uint16_t s_speed_loop_count = 0U;     /* 速度环分频计数器 */
+
+static float s_speed_iq_ref_cmd = 0.0f;     /* 速度环输出 iq_ref 斜坡缓冲 */
 /* ============================================================
  * 内部函数声明
  * ============================================================ */
@@ -104,6 +145,7 @@ static PID_Controller_t s_pid_iq;           /* Q 轴电流环 PID */
 static void Motor_Service_ClearData(void);
 
 static Motor_Service_Status_t Motor_Service_UpdateSensorData(float dt_s);
+static void Motor_Service_UpdateSpeed(float dt_s);
 
 static Motor_Service_Status_t Motor_Service_ApplyFOCOutput(void);
 static Motor_Service_Status_t Motor_Service_OutputVoltageElectrical(float ud,
@@ -113,6 +155,7 @@ static Motor_Service_Status_t Motor_Service_OutputVoltageElectrical(float ud,
 static Motor_Service_Status_t Motor_Service_RunIdle(void);
 static Motor_Service_Status_t Motor_Service_RunOpenLoop(float dt_s);
 static Motor_Service_Status_t Motor_Service_RunCurrentLoop(float dt_s);
+static Motor_Service_Status_t Motor_Service_RunSpeedLoop(float dt_s);
 
 /* ============================================================
  * 内部函数实现
@@ -138,6 +181,10 @@ static void Motor_Service_ClearData(void)
     s_motor.mechanical_angle = 0.0f;
     s_motor.electrical_angle = 0.0f;
 
+    s_motor.speed_raw_rpm = 0.0f;
+    s_motor.speed_rpm = 0.0f;
+    s_motor.speed_ref_rpm = 0.0f;
+
     s_motor.ia = 0.0f;
     s_motor.ib = 0.0f;
     s_motor.ic = 0.0f;
@@ -157,9 +204,11 @@ static void Motor_Service_ClearData(void)
 
     s_motor.pid_id_error = 0.0f;
     s_motor.pid_iq_error = 0.0f;
+    s_motor.pid_speed_error = 0.0f;
 
     s_motor.pid_id_output = 0.0f;
     s_motor.pid_iq_output = 0.0f;
+    s_motor.pid_speed_output = 0.0f;
 
     s_motor.duty.duty_a = 0.5f;
     s_motor.duty.duty_b = 0.5f;
@@ -167,6 +216,95 @@ static void Motor_Service_ClearData(void)
 
     s_motor.zero_electric_angle = MOTOR_SERVICE_ZERO_ELECTRIC_ANGLE;
     s_motor.direction = MOTOR_SERVICE_DIRECTION;
+
+    s_speed_ready = 0U;
+    s_speed_last_angle = 0.0f;
+    s_speed_accum_angle = 0.0f;
+    s_speed_accum_time = 0.0f;
+    s_speed_loop_count = 0U;
+    s_speed_iq_ref_cmd = 0.0f;
+}
+/**
+ * @brief 更新机械速度
+ *
+ * 功能：
+ * 1. 根据本次机械角度和上次机械角度计算角度增量
+ * 2. 处理 0 ~ 2pi 跳变
+ * 3. 累计一段时间后再计算速度，降低低速抖动
+ * 4. 将机械角速度转换成 rpm
+ * 5. 对速度进行低通滤波
+ *
+ * @param dt_s 距离上次调用的时间，单位 s
+ */
+static void Motor_Service_UpdateSpeed(float dt_s)
+{
+    float delta_angle;
+    float speed_rad_s;
+    float speed_rpm;
+
+    if (dt_s <= 0.0f)
+    {
+        return;
+    }
+
+    if (s_speed_ready == 0U)
+    {
+        s_speed_last_angle = s_motor.mechanical_angle;
+        s_speed_accum_angle = 0.0f;
+        s_speed_accum_time = 0.0f;
+        s_speed_ready = 1U;
+
+        s_motor.speed_raw_rpm = 0.0f;
+        s_motor.speed_rpm = 0.0f;
+
+        return;
+    }
+
+    delta_angle = s_motor.mechanical_angle - s_speed_last_angle;
+
+    if (delta_angle > 3.1415926f)
+    {
+        delta_angle -= FOC_2PI;
+    }
+    else if (delta_angle < -3.1415926f)
+    {
+        delta_angle += FOC_2PI;
+    }
+
+    s_speed_last_angle = s_motor.mechanical_angle;
+
+    s_speed_accum_angle += delta_angle;
+    s_speed_accum_time += dt_s;
+
+    /*
+     * 低速时不要每 1ms 计算一次速度。
+     * 这里累计 10ms 后再计算一次，可以明显减少速度尖峰。
+     */
+    if (s_speed_accum_time >= MOTOR_SERVICE_SPEED_EST_DT_S)
+    {
+        speed_rad_s = s_speed_accum_angle / s_speed_accum_time;
+
+        speed_rpm =
+            speed_rad_s
+            * MOTOR_SERVICE_RAD_TO_RPM
+            * MOTOR_SERVICE_SPEED_FEEDBACK_DIRECTION;
+
+        /*
+         * 异常速度限幅。
+         * 防止编码器瞬间跳变导致速度反馈出现巨大尖峰。
+         */
+        speed_rpm = FOC_LimitFloat(speed_rpm,
+                                   -MOTOR_SERVICE_SPEED_EST_MAX_RPM,
+                                   MOTOR_SERVICE_SPEED_EST_MAX_RPM);
+
+        s_motor.speed_raw_rpm = speed_rpm;
+
+        s_motor.speed_rpm =
+            LowPassFilter_Update(&s_lpf_speed, s_motor.speed_raw_rpm);
+
+        s_speed_accum_angle = 0.0f;
+        s_speed_accum_time = 0.0f;
+    }
 }
 
 /**
@@ -198,6 +336,8 @@ static Motor_Service_Status_t Motor_Service_UpdateSensorData(float dt_s)
         s_motor.raw_angle = AS5048A_GetRawAngle();
         s_motor.mechanical_angle = AS5048A_GetAngleRad();
         s_motor.electrical_angle = FOC_GetElectricalAngle(s_motor.mechanical_angle);
+
+        Motor_Service_UpdateSpeed(dt_s);
     }
     else
     {
@@ -356,11 +496,15 @@ static Motor_Service_Status_t Motor_Service_RunIdle(void)
     s_motor.duty.duty_b = 0.5f;
     s_motor.duty.duty_c = 0.5f;
 
+    s_motor.id_ref = 0.0f;
+    s_motor.iq_ref = 0.0f;
+
     s_motor.vd = 0.0f;
     s_motor.vq = 0.0f;
 
     s_motor.pid_id_output = 0.0f;
     s_motor.pid_iq_output = 0.0f;
+    s_motor.pid_speed_output = 0.0f;
 
     return MOTOR_SERVICE_OK;
 }
@@ -448,7 +592,174 @@ static Motor_Service_Status_t Motor_Service_RunCurrentLoop(float dt_s)
 
     return Motor_Service_ApplyFOCOutput();
 }
+/**
+ * @brief 速度环模式
+ *
+ * 速度环每 10ms 执行一次。
+ * 速度环输出 iq_ref。
+ * 电流环每 1ms 执行一次，继续负责 id / iq 闭环。
+ */
+static Motor_Service_Status_t Motor_Service_RunSpeedLoop(float dt_s)
+{
+    float speed_ref_abs;
+    float speed_abs;
+    float speed_output_target;
+    float speed_output_sign;
 
+    if (s_motor.encoder_ok == 0U)
+    {
+        return MOTOR_SERVICE_ERROR_ENCODER;
+    }
+
+    s_speed_loop_count++;
+
+    if (s_speed_loop_count >= MOTOR_SERVICE_SPEED_LOOP_DIVIDER)
+    {
+        s_speed_loop_count = 0U;
+
+        speed_output_target =
+            PID_Controller_Update(&s_pid_speed,
+                                  s_motor.speed_ref_rpm,
+                                  s_motor.speed_rpm,
+                                  MOTOR_SERVICE_SPEED_LOOP_DT_S);
+
+        s_motor.pid_speed_error = PID_Controller_GetError(&s_pid_speed);
+
+        speed_ref_abs = fabsf(s_motor.speed_ref_rpm);
+        speed_abs = fabsf(s_motor.speed_rpm);
+
+        if (s_motor.speed_ref_rpm > 0.5f)
+        {
+            speed_output_sign = 1.0f;
+        }
+        else if (s_motor.speed_ref_rpm < -0.5f)
+        {
+            speed_output_sign = -1.0f;
+        }
+        else
+        {
+            speed_output_sign = 0.0f;
+        }
+
+        /*
+         * 目标速度为正时，不允许输出负 iq_ref。
+         * 目标速度为负时，不允许输出正 iq_ref。
+         */
+        if (speed_output_sign > 0.0f)
+        {
+            if (speed_output_target < 0.0f)
+            {
+                speed_output_target = 0.0f;
+            }
+        }
+        else if (speed_output_sign < 0.0f)
+        {
+            if (speed_output_target > 0.0f)
+            {
+                speed_output_target = 0.0f;
+            }
+        }
+        else
+        {
+            speed_output_target = 0.0f;
+        }
+
+        /*
+         * 低速启动补偿。
+         *
+         * 只有实际速度低于目标速度 80% 时，给启动电流。
+         */
+        if ((speed_ref_abs > 1.0f) &&
+            (speed_abs < (speed_ref_abs * MOTOR_SERVICE_SPEED_START_EXIT_RATIO)))
+        {
+            if (fabsf(speed_output_target) < MOTOR_SERVICE_SPEED_START_IQ_MIN)
+            {
+                speed_output_target =
+                    speed_output_sign * MOTOR_SERVICE_SPEED_START_IQ_MIN;
+            }
+        }
+
+        /*
+         * 低速保持电流。
+         *
+         * 防止速度反馈短暂变大后，iq_ref 直接掉到 0，
+         * 造成“转几圈停一下”的现象。
+         */
+        if ((speed_ref_abs > 1.0f) &&
+            (speed_output_sign > 0.0f))
+        {
+            if ((speed_output_target > 0.0f) &&
+                (speed_output_target < MOTOR_SERVICE_SPEED_RUN_IQ_MIN))
+            {
+                speed_output_target = MOTOR_SERVICE_SPEED_RUN_IQ_MIN;
+            }
+        }
+        else if ((speed_ref_abs > 1.0f) &&
+                 (speed_output_sign < 0.0f))
+        {
+            if ((speed_output_target < 0.0f) &&
+                (speed_output_target > -MOTOR_SERVICE_SPEED_RUN_IQ_MIN))
+            {
+                speed_output_target = -MOTOR_SERVICE_SPEED_RUN_IQ_MIN;
+            }
+        }
+
+        speed_output_target =
+            FOC_LimitFloat(speed_output_target,
+                           -MOTOR_SERVICE_SPEED_LOOP_IQ_LIMIT,
+                           MOTOR_SERVICE_SPEED_LOOP_IQ_LIMIT);
+
+        /*
+         * iq_ref 斜坡限制。
+         */
+        if (speed_output_target > (s_speed_iq_ref_cmd + MOTOR_SERVICE_SPEED_IQ_SLEW_STEP))
+        {
+            s_speed_iq_ref_cmd += MOTOR_SERVICE_SPEED_IQ_SLEW_STEP;
+        }
+        else if (speed_output_target < (s_speed_iq_ref_cmd - MOTOR_SERVICE_SPEED_IQ_SLEW_STEP))
+        {
+            s_speed_iq_ref_cmd -= MOTOR_SERVICE_SPEED_IQ_SLEW_STEP;
+        }
+        else
+        {
+            s_speed_iq_ref_cmd = speed_output_target;
+        }
+
+        s_speed_iq_ref_cmd =
+            FOC_LimitFloat(s_speed_iq_ref_cmd,
+                           -MOTOR_SERVICE_SPEED_LOOP_IQ_LIMIT,
+                           MOTOR_SERVICE_SPEED_LOOP_IQ_LIMIT);
+
+        /*
+         * 二次方向限制。
+         */
+        if (speed_output_sign > 0.0f)
+        {
+            if (s_speed_iq_ref_cmd < 0.0f)
+            {
+                s_speed_iq_ref_cmd = 0.0f;
+            }
+        }
+        else if (speed_output_sign < 0.0f)
+        {
+            if (s_speed_iq_ref_cmd > 0.0f)
+            {
+                s_speed_iq_ref_cmd = 0.0f;
+            }
+        }
+        else
+        {
+            s_speed_iq_ref_cmd = 0.0f;
+        }
+
+        s_motor.pid_speed_output = s_speed_iq_ref_cmd;
+
+        s_motor.id_ref = 0.0f;
+        s_motor.iq_ref = s_motor.pid_speed_output;
+    }
+
+    return Motor_Service_RunCurrentLoop(dt_s);
+}
 /* ============================================================
  * 对外接口实现
  * ============================================================ */
@@ -508,6 +819,11 @@ Motor_Service_Status_t Motor_Service_Init(void)
     LowPassFilter_Init(&s_lpf_ib, MOTOR_SERVICE_CURRENT_LPF_ALPHA);
 
     /*
+     * 初始化速度低通滤波器。
+     */
+    LowPassFilter_Init(&s_lpf_speed, MOTOR_SERVICE_SPEED_LPF_ALPHA);
+
+    /*
      * 初始化编码器。
      */
     encoder_status = AS5048A_Init();
@@ -562,6 +878,19 @@ Motor_Service_Status_t Motor_Service_Init(void)
                         -MOTOR_SERVICE_PID_INTEGRAL_LIMIT,
                         MOTOR_SERVICE_PID_INTEGRAL_LIMIT);
 
+    /*
+     * 初始化速度环 PID。
+     * 速度环输出单位为 A，对应 iq_ref。
+     */
+    PID_Controller_Init(&s_pid_speed,
+                        MOTOR_SERVICE_PID_SPEED_KP,
+                        MOTOR_SERVICE_PID_SPEED_KI,
+                        MOTOR_SERVICE_PID_SPEED_KD,
+                        -MOTOR_SERVICE_SPEED_LOOP_IQ_LIMIT,
+                        MOTOR_SERVICE_SPEED_LOOP_IQ_LIMIT,
+                        -MOTOR_SERVICE_PID_SPEED_INTEGRAL_LIMIT,
+                        MOTOR_SERVICE_PID_SPEED_INTEGRAL_LIMIT);
+
     return MOTOR_SERVICE_OK;
 }
 
@@ -583,8 +912,9 @@ Motor_Service_Status_t Motor_Service_Update(float dt_s)
     /*
      * 统一更新传感器：
      * 1. 编码器角度
-     * 2. 电流采样
-     * 3. Clarke / Park 变换
+     * 2. 机械速度
+     * 3. 电流采样
+     * 4. Clarke / Park 变换
      */
     status = Motor_Service_UpdateSensorData(dt_s);
 
@@ -603,6 +933,10 @@ Motor_Service_Status_t Motor_Service_Update(float dt_s)
     else if (s_motor.mode == MOTOR_SERVICE_MODE_CURRENT_LOOP)
     {
         status = Motor_Service_RunCurrentLoop(dt_s);
+    }
+    else if (s_motor.mode == MOTOR_SERVICE_MODE_SPEED_LOOP)
+    {
+        status = Motor_Service_RunSpeedLoop(dt_s);
     }
     else
     {
@@ -654,8 +988,11 @@ void Motor_Service_StartCurrentLoop(float id_ref, float iq_ref)
     s_motor.vd = 0.0f;
     s_motor.vq = 0.0f;
 
+    s_motor.pid_speed_output = 0.0f;
+
     PID_Controller_Reset(&s_pid_id);
     PID_Controller_Reset(&s_pid_iq);
+    PID_Controller_Reset(&s_pid_speed);
 
     s_motor.mode = MOTOR_SERVICE_MODE_CURRENT_LOOP;
 }
@@ -667,6 +1004,44 @@ void Motor_Service_SetCurrentReference(float id_ref, float iq_ref)
 {
     s_motor.id_ref = id_ref;
     s_motor.iq_ref = iq_ref;
+}
+
+/**
+ * @brief 启动速度环模式
+ *
+ * @param speed_ref_rpm 目标机械转速，单位 rpm
+ */
+void Motor_Service_StartSpeedLoop(float speed_ref_rpm)
+{
+    s_motor.speed_ref_rpm = speed_ref_rpm;
+
+    s_motor.id_ref = 0.0f;
+    s_motor.iq_ref = 0.0f;
+
+    s_motor.vd = 0.0f;
+    s_motor.vq = 0.0f;
+
+    s_motor.pid_speed_error = 0.0f;
+    s_motor.pid_speed_output = 0.0f;
+
+    s_speed_loop_count = 0U;
+    s_speed_iq_ref_cmd = 0.0f;
+
+    PID_Controller_Reset(&s_pid_id);
+    PID_Controller_Reset(&s_pid_iq);
+    PID_Controller_Reset(&s_pid_speed);
+
+    s_motor.mode = MOTOR_SERVICE_MODE_SPEED_LOOP;
+}
+
+/**
+ * @brief 设置速度环目标转速
+ *
+ * @param speed_ref_rpm 目标机械转速，单位 rpm
+ */
+void Motor_Service_SetSpeedReference(float speed_ref_rpm)
+{
+    s_motor.speed_ref_rpm = speed_ref_rpm;
 }
 
 /**
@@ -685,11 +1060,17 @@ void Motor_Service_Stop(void)
     s_motor.id_ref = 0.0f;
     s_motor.iq_ref = 0.0f;
 
+    s_motor.speed_ref_rpm = 0.0f;
+    s_motor.pid_speed_output = 0.0f;
+
     s_motor.vd = 0.0f;
     s_motor.vq = 0.0f;
 
+    s_speed_loop_count = 0U;
+
     PID_Controller_Reset(&s_pid_id);
     PID_Controller_Reset(&s_pid_iq);
+    PID_Controller_Reset(&s_pid_speed);
 
     Motor_Service_DisableDriver();
 }
@@ -930,4 +1311,36 @@ float Motor_Service_GetVd(void)
 float Motor_Service_GetVq(void)
 {
     return s_motor.vq;
+}
+
+/**
+ * @brief 获取目标转速
+ */
+float Motor_Service_GetSpeedRef(void)
+{
+    return s_motor.speed_ref_rpm;
+}
+
+/**
+ * @brief 获取当前转速
+ */
+float Motor_Service_GetSpeedRpm(void)
+{
+    return s_motor.speed_rpm;
+}
+
+/**
+ * @brief 获取速度误差
+ */
+float Motor_Service_GetSpeedError(void)
+{
+    return s_motor.pid_speed_error;
+}
+
+/**
+ * @brief 获取速度环输出
+ */
+float Motor_Service_GetSpeedOutput(void)
+{
+    return s_motor.pid_speed_output;
 }

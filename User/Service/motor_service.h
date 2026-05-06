@@ -28,7 +28,8 @@ typedef enum
 {
     MOTOR_SERVICE_MODE_IDLE = 0,                    /**< 空闲模式，PWM 输出中性占空比 */
     MOTOR_SERVICE_MODE_OPEN_LOOP_ELECTRICAL = 1,    /**< 开环电角度模式 */
-    MOTOR_SERVICE_MODE_CURRENT_LOOP = 2             /**< 电流环模式 */
+    MOTOR_SERVICE_MODE_CURRENT_LOOP = 2,            /**< 电流环模式 */
+    MOTOR_SERVICE_MODE_SPEED_LOOP = 3               /**< 速度环模式，速度环输出 iq_ref，电流环负责执行 */
 } Motor_Service_Mode_t;
 
 /* ============================================================
@@ -50,6 +51,10 @@ typedef struct
     float mechanical_angle;             /**< 机械角度，单位 rad，范围 0 ~ 2pi */
     float electrical_angle;             /**< 电角度，单位 rad，范围 0 ~ 2pi */
 
+    float speed_raw_rpm;                /**< 原始机械转速，单位 rpm */
+    float speed_rpm;                    /**< 低通滤波后的机械转速，单位 rpm */
+    float speed_ref_rpm;                /**< 速度环目标转速，单位 rpm */
+
     float ia;                           /**< A 相电流，单位 A */
     float ib;                           /**< B 相电流，单位 A */
     float ic;                           /**< C 相电流，单位 A */
@@ -69,9 +74,11 @@ typedef struct
 
     float pid_id_error;                 /**< D 轴电流误差，单位 A */
     float pid_iq_error;                 /**< Q 轴电流误差，单位 A */
+    float pid_speed_error;              /**< 速度环误差，单位 rpm */
 
     float pid_id_output;                /**< D 轴 PID 输出，单位 V */
     float pid_iq_output;                /**< Q 轴 PID 输出，单位 V */
+    float pid_speed_output;             /**< 速度环 PID 输出，单位 A，对应 iq_ref */
 
     FOC_AlphaBeta_t current_alpha_beta; /**< Alpha-Beta 坐标系电流 */
     FOC_DQ_t current_dq;                /**< D-Q 坐标系电流 */
@@ -113,6 +120,18 @@ float Motor_Service_GetVd(void);        /* 获取 D 轴电压 */
 float Motor_Service_GetVq(void);        /* 获取 Q 轴电压 */
 
 /* ============================================================
+ * 速度环接口
+ * ============================================================ */
+
+void Motor_Service_StartSpeedLoop(float speed_ref_rpm);          /* 启动速度环模式 */
+void Motor_Service_SetSpeedReference(float speed_ref_rpm);       /* 设置速度环目标转速 */
+
+float Motor_Service_GetSpeedRef(void);                           /* 获取目标转速 */
+float Motor_Service_GetSpeedRpm(void);                           /* 获取当前转速 */
+float Motor_Service_GetSpeedError(void);                         /* 获取速度误差 */
+float Motor_Service_GetSpeedOutput(void);                        /* 获取速度环输出 iq_ref */
+
+/* ============================================================
  * 驱动控制接口
  * ============================================================ */
 
@@ -134,3 +153,4 @@ Motor_Service_Mode_t Motor_Service_GetMode(void);            /* 获取当前模式 */
 const Motor_Service_Data_t *Motor_Service_GetData(void);     /* 获取电机服务数据结构指针 */
 
 #endif
+
