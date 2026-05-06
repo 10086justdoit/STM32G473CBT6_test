@@ -12,6 +12,7 @@
 #include "ina240.h"
 #include "low_pass_filter.h"
 #include "foc.h"
+#include "pid_controller.h"
 
 #include <math.h>
 #include <string.h>
@@ -42,6 +43,30 @@
 #define MOTOR_SERVICE_ALIGN_HOLD_DELAY_MS      400U   /* 传感器对齐保持 delay */
 #define MOTOR_SERVICE_ALIGN_ANGLE              FOC_3PI_2 /* 传感器对齐目标角度，单位 rad，范围 0 ~ 2pi */
 
+
+/* ============================================================
+ * 电流环 PID 配置
+ *
+ * 当前 1ms 调试周期下，参数必须保守。
+ * 后面如果改成 50us~100us 定时器中断，需要重新整定。
+ * ============================================================ */
+
+#define MOTOR_SERVICE_CURRENT_LOOP_DT_S         0.001f    /* 电流环调节周期，单位秒，当前为 1ms */
+
+#define MOTOR_SERVICE_CURRENT_LOOP_V_LIMIT      2.5f    /* 电流环输出电压限制，单位 V，必须小于母线电压 */
+
+#define MOTOR_SERVICE_PID_ID_KP                 30.0f    /* D 轴电流环 P 参数 */
+#define MOTOR_SERVICE_PID_ID_KI                 8.0f    /* D 轴电流环 I 参数 */
+#define MOTOR_SERVICE_PID_ID_KD                 0.0f    /* D 轴电流环 D 参数 */
+
+#define MOTOR_SERVICE_PID_IQ_KP                 30.0f    /* Q 轴电流环 P 参数 */
+#define MOTOR_SERVICE_PID_IQ_KI                 8.0f    /* Q 轴电流环 I 参数 */
+#define MOTOR_SERVICE_PID_IQ_KD                 0.0f    /* Q 轴电流环 D 参数 */
+
+#define MOTOR_SERVICE_PID_INTEGRAL_LIMIT        2.0f    /* PID 积分项限制，单位 V，防止积分过大导致输出过冲 */
+
+
+
 /* ============================================================
  * 模块内部变量
  * ============================================================ */
@@ -51,7 +76,8 @@ static Motor_Service_Data_t s_motor;    /* 电机服务数据结构体实例 */
 static LowPassFilter_t s_lpf_ia;        /* A 相电流低通滤波器实例 */
 static LowPassFilter_t s_lpf_ib;        /* B 相电流低通滤波器实例 */
 
-
+static PID_Controller_t s_pid_id;       /* D 轴电流环 PID 控制器实例 */
+static PID_Controller_t s_pid_iq;       /* Q 轴电流环 PID 控制器实例 */
 /* ============================================================
  * 内部函数
  * ============================================================ */
@@ -61,14 +87,30 @@ static void Motor_Service_ClearData(void)
 {
     memset(&s_motor, 0, sizeof(s_motor));
 
-    s_motor.mode = MOTOR_SERVICE_MODE_IDLE;
-    s_motor.driver_enabled = 0U;
-    s_motor.encoder_ok = 0U;
+    s_motor.mode = MOTOR_SERVICE_MODE_IDLE;         /* 默认空闲模式 */
+    s_motor.driver_enabled = 0U;                    /* 驱动默认关闭 */
+    s_motor.encoder_ok = 0U;                        /* 编码器状态默认错误，必须成功读取一次才能置位 */ 
 
-    s_motor.open_loop_uq = MOTOR_SERVICE_OPEN_LOOP_UQ_DEFAULT;
-    s_motor.open_loop_frequency_hz = MOTOR_SERVICE_OPEN_LOOP_FREQ_DEFAULT;
+    s_motor.open_loop_uq = MOTOR_SERVICE_OPEN_LOOP_UQ_DEFAULT;              /* 开环模式默认 Uq 电压幅值 */
+    s_motor.open_loop_frequency_hz = MOTOR_SERVICE_OPEN_LOOP_FREQ_DEFAULT;  /* 开环模式默认电角度旋转频率 */
 
-    s_motor.direction = 1;
+    s_motor.id_ref = 0.0f;      /* 电流环默认 D/Q 轴电流指令 */
+    s_motor.iq_ref = 0.0f;      /* 电流环默认 D/Q 轴电流指令 */
+
+    s_motor.id_meas = 0.0f;     /* 电流环默认 D/Q 轴电流测量值 */
+    s_motor.iq_meas = 0.0f;     /* 电流环默认 D/Q 轴电流测量值 */
+
+    s_motor.vd = 0.0f;              /* 电流环默认 D/Q 轴电压 */
+    s_motor.vq = 0.0f;              /* 电流环默认 D/Q 轴电压 */
+
+    s_motor.pid_id_error = 0.0f;    /* 电流环默认 D/Q 轴电流误差 */
+    s_motor.pid_iq_error = 0.0f;    /* 电流环默认 D/Q 轴电流误差 */
+
+    s_motor.pid_id_output = 0.0f;   /* 电流环默认 D/Q 轴 PID 输出 */
+    s_motor.pid_iq_output = 0.0f;   /* 电流环默认 D/Q 轴 PID 输出 */
+
+
+    s_motor.direction = 1;                                                  /* 默认旋转方向，1 表示正向，-1 表示反向 */
 }
 
 /* 更新传感器数据，读取编码器和电流传感器，计算角度和 Clarke/Park 变换 */
@@ -124,6 +166,9 @@ static Motor_Service_Status_t Motor_Service_UpdateSensorData(float dt_s)
 
     s_motor.current_dq =
         FOC_Park(s_motor.current_alpha_beta, s_motor.electrical_angle);
+    
+    s_motor.id_meas = s_motor.current_dq.d;
+    s_motor.iq_meas = s_motor.current_dq.q;
 
     return MOTOR_SERVICE_OK;
 }
@@ -158,6 +203,56 @@ static Motor_Service_Status_t Motor_Service_OutputVoltageElectrical(float ud,
     return Motor_Service_ApplyFOCOutput();
 }
 
+/* 根据 D/Q 轴电流指令计算 PWM 占空比 */
+static Motor_Service_Status_t Motor_Service_RunCurrentLoop(float dt_s)
+{
+    FOC_Status_t foc_status;
+
+    /*
+     * Id/Iq 电流误差：
+     * id_ref 通常设为 0
+     * iq_ref 决定转矩
+     */
+    s_motor.vd = PID_Controller_Update(&s_pid_id,
+                                       s_motor.id_ref,
+                                       s_motor.id_meas,
+                                       dt_s);
+
+    s_motor.vq = PID_Controller_Update(&s_pid_iq,
+                                       s_motor.iq_ref,
+                                       s_motor.iq_meas,
+                                       dt_s);
+    /*
+     * 电压限制，防止过大导致驱动器进入保护。
+     */                                   
+    s_motor.vd = FOC_LimitFloat(s_motor.vd,
+                            -MOTOR_SERVICE_CURRENT_LOOP_V_LIMIT,
+                            MOTOR_SERVICE_CURRENT_LOOP_V_LIMIT);
+
+    s_motor.vq = FOC_LimitFloat(s_motor.vq,
+                            -MOTOR_SERVICE_CURRENT_LOOP_V_LIMIT,
+                            MOTOR_SERVICE_CURRENT_LOOP_V_LIMIT);
+
+    s_motor.pid_id_error = PID_Controller_GetError(&s_pid_id);
+    s_motor.pid_iq_error = PID_Controller_GetError(&s_pid_iq);
+
+    s_motor.pid_id_output = PID_Controller_GetOutput(&s_pid_id);
+    s_motor.pid_iq_output = PID_Controller_GetOutput(&s_pid_iq);
+
+    /*
+     * 使用机械角度输入，FOC 内部根据 zero_electric_angle 转成电角度。
+     */
+    foc_status = FOC_SetVoltageDQ(s_motor.vd,
+                                  s_motor.vq,
+                                  s_motor.mechanical_angle);
+
+    if (foc_status != FOC_OK)
+    {
+        return MOTOR_SERVICE_ERROR_FOC;
+    }
+
+    return Motor_Service_ApplyFOCOutput();
+}
 /* ============================================================
  * 对外接口
  * ============================================================ */
@@ -237,10 +332,28 @@ Motor_Service_Status_t Motor_Service_Init(void)
      */
     FOC_Init();
 
+    PID_Controller_Init(&s_pid_id,
+                        MOTOR_SERVICE_PID_ID_KP,
+                        MOTOR_SERVICE_PID_ID_KI,
+                        MOTOR_SERVICE_PID_ID_KD,
+                        -MOTOR_SERVICE_CURRENT_LOOP_V_LIMIT,
+                        MOTOR_SERVICE_CURRENT_LOOP_V_LIMIT,
+                        -MOTOR_SERVICE_PID_INTEGRAL_LIMIT,
+                        MOTOR_SERVICE_PID_INTEGRAL_LIMIT);
+
+    PID_Controller_Init(&s_pid_iq,
+                        MOTOR_SERVICE_PID_IQ_KP,
+                        MOTOR_SERVICE_PID_IQ_KI,
+                        MOTOR_SERVICE_PID_IQ_KD,
+                        -MOTOR_SERVICE_CURRENT_LOOP_V_LIMIT,
+                        MOTOR_SERVICE_CURRENT_LOOP_V_LIMIT,
+                        -MOTOR_SERVICE_PID_INTEGRAL_LIMIT,
+                        MOTOR_SERVICE_PID_INTEGRAL_LIMIT);
+
     FOC_SetBusVoltage(MOTOR_SERVICE_BUS_VOLTAGE);       /* 设置母线电压 */
     FOC_SetPolePairs(MOTOR_SERVICE_POLE_PAIRS);         /* 设置极对数 */
     FOC_SetDirection(1);                                /* 设置默认方向，1 或 -1，正向或反向 */
-    FOC_SetZeroElectricAngle(0.0f);                     /* 设置默认电角度零位，单位 rad，范围 0 ~ 2pi */
+    FOC_SetZeroElectricAngle(0.587899f);                /* 设置默认电角度零位，单位 rad，范围 0 ~ 2pi */
 
     s_motor.zero_electric_angle = FOC_GetZeroElectricAngle();  /* 读取电角度零位，保存到数据结构 */
     s_motor.direction = FOC_GetDirection();                    /* 读取方向，保存到数据结构 */
@@ -258,6 +371,12 @@ Motor_Service_Status_t Motor_Service_Update(float dt_s)
         return MOTOR_SERVICE_ERROR_PARAM;
     }
 
+    /*
+     * 先统一更新传感器数据：
+     * 1. AS5048A 角度
+     * 2. INA240 电流
+     * 3. Clarke / Park 得到 id/iq
+     */
     status = Motor_Service_UpdateSensorData(dt_s);
 
     if (status != MOTOR_SERVICE_OK)
@@ -265,6 +384,9 @@ Motor_Service_Status_t Motor_Service_Update(float dt_s)
         return status;
     }
 
+    /*
+     * 根据当前模式执行对应控制逻辑。
+     */
     if (s_motor.mode == MOTOR_SERVICE_MODE_OPEN_LOOP_ELECTRICAL)
     {
         s_motor.open_loop_electrical_angle +=
@@ -282,6 +404,15 @@ Motor_Service_Status_t Motor_Service_Update(float dt_s)
             return status;
         }
     }
+    else if (s_motor.mode == MOTOR_SERVICE_MODE_CURRENT_LOOP)
+    {
+        status = Motor_Service_RunCurrentLoop(dt_s);
+
+        if (status != MOTOR_SERVICE_OK)
+        {
+            return status;
+        }
+    }
     else
     {
         /*
@@ -292,6 +423,11 @@ Motor_Service_Status_t Motor_Service_Update(float dt_s)
         s_motor.duty.duty_a = 0.5f;
         s_motor.duty.duty_b = 0.5f;
         s_motor.duty.duty_c = 0.5f;
+
+        s_motor.vd = 0.0f;
+        s_motor.vq = 0.0f;
+        s_motor.pid_id_output = 0.0f;
+        s_motor.pid_iq_output = 0.0f;
     }
 
     return MOTOR_SERVICE_OK;
@@ -516,4 +652,61 @@ Motor_Service_Mode_t Motor_Service_GetMode(void)
 const Motor_Service_Data_t *Motor_Service_GetData(void)
 {
     return &s_motor;
+}
+
+/* 电流环控制模式，根据设定的 D/Q 轴电流指令计算 PWM 占空比 */
+void Motor_Service_StartCurrentLoop(float id_ref, float iq_ref)
+{
+    s_motor.id_ref = id_ref;
+    s_motor.iq_ref = iq_ref;
+
+    s_motor.vd = 0.0f;
+    s_motor.vq = 0.0f;
+
+    PID_Controller_Reset(&s_pid_id);
+    PID_Controller_Reset(&s_pid_iq);
+
+    s_motor.mode = MOTOR_SERVICE_MODE_CURRENT_LOOP;
+}
+
+/* 设置电流环 D/Q 轴电流指令 */
+void Motor_Service_SetCurrentReference(float id_ref, float iq_ref)
+{
+    s_motor.id_ref = id_ref;
+    s_motor.iq_ref = iq_ref;
+}
+
+/* 获取当前 D/Q 轴电流指令 */
+float Motor_Service_GetIdRef(void)
+{
+    return s_motor.id_ref;
+}
+
+/* 获取当前 D/Q 轴电流指令 */
+float Motor_Service_GetIqRef(void)
+{
+    return s_motor.iq_ref;
+}
+
+/* 获取当前 D/Q 轴电流测量值 */
+float Motor_Service_GetIdMeas(void)
+{
+    return s_motor.id_meas;
+}
+
+/* 获取当前 D/Q 轴电流测量值 */
+float Motor_Service_GetIqMeas(void)
+{
+    return s_motor.iq_meas;
+}
+
+/* 获取当前 D/Q 轴电压指令 */
+float Motor_Service_GetVd(void)
+{
+    return s_motor.vd;
+}
+/* 获取当前 D/Q 轴电压指令 */
+float Motor_Service_GetVq(void)
+{
+    return s_motor.vq;
 }

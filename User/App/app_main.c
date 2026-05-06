@@ -1,66 +1,343 @@
+// 
+
+
+
+
 #include "app_main.h"
 #include "main.h"
 
 #include "bsp_uart.h"
 #include "vofa_service.h"
-#include "pid_controller.h"
 
-#define APP_PID_TEST_DT_S       0.001f
+#include "motor_service.h"
 
-static PID_Controller_t s_pid_test;
-static float s_feedback = 0.0f;
+/* ============================================================
+ * 电流环 PI 阶跃测试参数
+ * ============================================================ */
+
+#define APP_MOTOR_DT_S                  0.001f
+
+/*
+ * 初始软启动目标：0.2A
+ * 阶跃目标：0.4A
+ */
+#define APP_ID_REF                      0.0f
+#define APP_IQ_SOFT_TARGET_REF          0.20f
+#define APP_IQ_STEP_TARGET_REF          0.36f
+
+/*
+ * iq_ref 软启动步进。
+ *
+ * 每 1ms 增加 0.00005A。
+ * 从 0A 到 0.2A 约 4 秒。
+ */
+#define APP_IQ_RAMP_STEP                0.00005f
+
+/*
+ * 启动后等待 1 秒再使能驱动。
+ */
+#define APP_ENABLE_DELAY_COUNT          1000U
+
+/*
+ * 达到 0.2A 后，保持 3 秒，再阶跃到 0.4A。
+ */
+#define APP_LOW_CURRENT_HOLD_COUNT      10000U
+
+/*
+ * 阶跃到 0.4A 后，保持运行观察。
+ */
+#define APP_HIGH_CURRENT_HOLD_COUNT     10000U
+
+/*
+ * 软件过流保护。
+ */
+#define APP_CURRENT_LIMIT_A             1.0f
+
+/*
+ * 打印周期。
+ *
+ * 50 表示约 50ms 打印一次。
+ * VOFA 的 Δt 建议设置为 50ms。
+ */
+#define APP_PRINT_DIVIDER               50U
+
+/* ============================================================
+ * 测试状态机
+ * ============================================================ */
+
+typedef enum
+{
+    APP_CURRENT_TEST_WAIT_ENABLE = 0,
+    APP_CURRENT_TEST_RAMP_TO_0P2,
+    APP_CURRENT_TEST_HOLD_0P2,
+    APP_CURRENT_TEST_STEP_TO_0P4,
+    APP_CURRENT_TEST_HOLD_0P4,
+    APP_CURRENT_TEST_STOP
+} App_Current_Test_State_t;
+
+/* ============================================================
+ * 模块内部变量
+ * ============================================================ */
+
+static App_Current_Test_State_t s_test_state = APP_CURRENT_TEST_WAIT_ENABLE;
+
+static uint16_t s_print_count = 0U;
+static uint16_t s_enable_delay_count = 0U;
+static uint16_t s_hold_count = 0U;
+
+static float s_iq_ref = 0.0f;
+  
+
+/* ============================================================
+ * App 初始化
+ * ============================================================ */
 
 void App_Init(void)
 {
+    Motor_Service_Status_t status;
+
     BSP_UART_Init();
     VOFA_Service_Init();
 
-    /*
-     * 测试 PID：
-     * target = 1.0
-     * feedback 模拟被控对象，慢慢跟随 output。
-     */
-    PID_Controller_Init(&s_pid_test,
-                        1.0f,       /* Kp */
-                        2.0f,       /* Ki */
-                        0.0f,       /* Kd */
-                        -3.0f,      /* output min */
-                        3.0f,       /* output max */
-                        -1.0f,      /* integral min */
-                        1.0f);      /* integral max */
+    status = Motor_Service_Init();
 
-    VOFA_Service_SendTextLine("PID test start");
+    if (status == MOTOR_SERVICE_OK)
+    {
+        VOFA_Service_SendTextLine("Motor_Service init ok");
+    }
+    else
+    {
+        VOFA_Service_FireWater("Motor_Service init failed,%d", status);
+        return;
+    }
+
+    /*
+     * 启动电流环模式，但初始 iq_ref = 0。
+     */
+    s_iq_ref = 0.0f;
+
+    Motor_Service_StartCurrentLoop(APP_ID_REF, s_iq_ref);
+    Motor_Service_DisableDriver();
+
+ 
+    s_enable_delay_count = 0U;
+    s_hold_count = 0U;
+    s_print_count = 0U;
+
+    s_test_state = APP_CURRENT_TEST_WAIT_ENABLE;
+
+    VOFA_Service_SendTextLine("Current loop step test prepare");
 }
 
 void App_Start(void)
 {
 }
 
+/* ============================================================
+ * 电流目标状态机
+ * ============================================================ */
+
+static void App_CurrentTest_UpdateReference(void)
+{
+    switch (s_test_state)
+    {
+        case APP_CURRENT_TEST_WAIT_ENABLE:
+        {
+            s_enable_delay_count++;
+
+            if (s_enable_delay_count >= APP_ENABLE_DELAY_COUNT)
+            {
+                Motor_Service_EnableDriver();
+
+               
+                s_iq_ref = 0.0f;
+
+                Motor_Service_SetCurrentReference(APP_ID_REF, s_iq_ref);
+
+                s_test_state = APP_CURRENT_TEST_RAMP_TO_0P2;
+
+                VOFA_Service_SendTextLine("Current loop driver enabled");
+                VOFA_Service_SendTextLine("Ramp to 0.2A");
+            }
+            break;
+        }
+
+        case APP_CURRENT_TEST_RAMP_TO_0P2:
+        {
+            /*
+             * 软启动到 0.2A。
+             */
+            if (s_iq_ref < APP_IQ_SOFT_TARGET_REF)
+            {
+                s_iq_ref += APP_IQ_RAMP_STEP;
+
+                if (s_iq_ref > APP_IQ_SOFT_TARGET_REF)
+                {
+                    s_iq_ref = APP_IQ_SOFT_TARGET_REF;
+                }
+
+                Motor_Service_SetCurrentReference(APP_ID_REF, s_iq_ref);
+            }
+            else
+            {
+                s_iq_ref = APP_IQ_SOFT_TARGET_REF;
+                Motor_Service_SetCurrentReference(APP_ID_REF, s_iq_ref);
+
+                s_hold_count = 0U;
+                s_test_state = APP_CURRENT_TEST_HOLD_0P2;
+
+                VOFA_Service_SendTextLine("Hold 0.2A");
+            }
+            break;
+        }
+
+        case APP_CURRENT_TEST_HOLD_0P2:
+        {
+            /*
+             * 保持 0.2A，等待电流稳定。
+             */
+            s_iq_ref = APP_IQ_SOFT_TARGET_REF;
+            Motor_Service_SetCurrentReference(APP_ID_REF, s_iq_ref);
+
+            s_hold_count++;
+
+            if (s_hold_count >= APP_LOW_CURRENT_HOLD_COUNT)
+            {
+                /*
+                 * 突然阶跃到 0.4A。
+                 */
+                s_iq_ref = APP_IQ_STEP_TARGET_REF;
+                Motor_Service_SetCurrentReference(APP_ID_REF, s_iq_ref);
+
+                s_hold_count = 0U;
+                s_test_state = APP_CURRENT_TEST_STEP_TO_0P4;
+
+                VOFA_Service_SendTextLine("Step to 0.4A");
+            }
+            break;
+        }
+
+        case APP_CURRENT_TEST_STEP_TO_0P4:
+        {
+            /*
+             * 进入 0.4A 保持阶段。
+             */
+            s_iq_ref = APP_IQ_STEP_TARGET_REF;
+            Motor_Service_SetCurrentReference(APP_ID_REF, s_iq_ref);
+
+            s_test_state = APP_CURRENT_TEST_HOLD_0P4;
+            s_hold_count = 0U;
+            break;
+        }
+
+        case APP_CURRENT_TEST_HOLD_0P4:
+        {
+            /*
+             * 保持 0.4A，观察阶跃响应。
+             */
+            s_iq_ref = APP_IQ_STEP_TARGET_REF;
+            Motor_Service_SetCurrentReference(APP_ID_REF, s_iq_ref);
+
+            s_hold_count++;
+
+            if (s_hold_count >= APP_HIGH_CURRENT_HOLD_COUNT)
+            {
+                /*
+                 * 测试结束后继续保持 0.4A。
+                 * 如果你想测试结束后自动停机，可以打开下面两行。
+                 */
+                /*
+                Motor_Service_Stop();
+                s_test_state = APP_CURRENT_TEST_STOP;
+                */
+            }
+            break;
+        }
+
+        case APP_CURRENT_TEST_STOP:
+        default:
+        {
+            s_iq_ref = 0.0f;
+            Motor_Service_SetCurrentReference(APP_ID_REF, s_iq_ref);
+            break;
+        }
+    }
+}
+
+/* ============================================================
+ * App 主循环
+ * ============================================================ */
+
 void App_Loop(void)
 {
-    float target;
-    float output;
-
-    target = 1.0f;
-
-    output = PID_Controller_Update(&s_pid_test,
-                                   target,
-                                   s_feedback,
-                                   APP_PID_TEST_DT_S);
+    Motor_Service_Status_t status;
+    const Motor_Service_Data_t *motor;
 
     /*
-     * 简单模拟一个一阶对象：
-     * feedback 慢慢跟随 output。
+     * 1. 更新 iq_ref：
+     *    0 -> 0.2A 软启动
+     *    0.2A 保持
+     *    0.2A -> 0.4A 阶跃
      */
-    s_feedback = s_feedback + 0.01f * (output - s_feedback);
+    App_CurrentTest_UpdateReference();
 
-    VOFA_Service_FireWater("%.3f,%.3f,%.3f,%.3f,%.3f,%.3f",
-                           target,
-                           s_feedback,
-                           PID_Controller_GetError(&s_pid_test),
-                           PID_Controller_GetOutput(&s_pid_test),
-                           PID_Controller_GetPTerm(&s_pid_test),
-                           PID_Controller_GetITerm(&s_pid_test));
+    /*
+     * 2. 执行电机服务。
+     */
+    status = Motor_Service_Update(APP_MOTOR_DT_S);
 
-    HAL_Delay(10);
+    if (status != MOTOR_SERVICE_OK)
+    {
+        Motor_Service_Stop();
+
+        VOFA_Service_FireWater("Motor_Service error,%d", status);
+
+        HAL_Delay(100);
+        return;
+    }
+
+    motor = Motor_Service_GetData();
+
+    /*
+     * 3. 软件过流保护。
+     */
+    if ((motor->ia_lpf > APP_CURRENT_LIMIT_A) ||
+        (motor->ia_lpf < -APP_CURRENT_LIMIT_A) ||
+        (motor->ib_lpf > APP_CURRENT_LIMIT_A) ||
+        (motor->ib_lpf < -APP_CURRENT_LIMIT_A))
+    {
+        Motor_Service_Stop();
+
+        s_test_state = APP_CURRENT_TEST_STOP;
+
+        VOFA_Service_SendTextLine("over current stop");
+
+        HAL_Delay(500);
+        return;
+    }
+
+    /*
+     * 4. VOFA 输出。
+     *
+     * I0 = iq_ref
+     * I1 = iq_meas
+     * I2 = id_meas
+     * I3 = vq
+     * I4 = state
+     */
+    s_print_count++;
+
+    if (s_print_count >= APP_PRINT_DIVIDER)
+    {
+        s_print_count = 0U;
+
+        VOFA_Service_FireWater("%.4f,%.4f,%.4f,%.4f",
+                               motor->iq_ref,
+                               motor->iq_meas,
+                               motor->id_meas,
+                                motor->vq);
+    }
+
+    HAL_Delay(1);
 }
+
